@@ -31,17 +31,26 @@ public class KeyDir {
     }
 
     /** Metadata stored for each key */
+    // in KeyDir.java
     public static class EntryMeta {
-        public final int fileId;       // which dataN.dat file
-        public final long valueOffset; // offset inside file where value starts
-        public final int valueSize;    // size of value in bytes
-        public final byte flag;        // FLAG_PUT or FLAG_TOMBSTONE
+        public final int fileId;
+        public final long valueOffset;
+        public final int valueSize;
+        public final byte flag;
+
+        // NEW: entryStart to break ties across overwrites in same file
+        public final long entryStart;
 
         public EntryMeta(int fileId, long valueOffset, int valueSize, byte flag) {
+            this(fileId, valueOffset, valueSize, flag, -1L);
+        }
+        public EntryMeta(int fileId, long valueOffset, int valueSize, byte flag, long entryStart) {
             this.fileId = fileId;
             this.valueOffset = valueOffset;
             this.valueSize = valueSize;
             this.flag = flag;
+            this.entryStart = entryStart;
         }
     }
+
 }

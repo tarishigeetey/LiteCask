@@ -3,6 +3,14 @@ package com.litecask;
 import java.io.*;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 public class LiteCask {
 	private static final long MAX_FILE_SIZE = 64 * 1024 * 1024; // 64 MB
@@ -30,10 +38,10 @@ public class LiteCask {
     	        }
     	    }
     	    // Read existing files (if any), rebuild KeyDir and decide activeFileId
-    	    loadCheckpoint(); 
+    	    int lastCheckpointed = loadCheckpoint(); 
     	    
     	    // Read existing files (if any), rebuild KeyDir and decide activeFileId
-    	    rebuildFromDisk();
+    	    rebuildFromDisk(lastCheckpointed);
 
     	    // Open (or create) the active file and seek to end
     	    openActiveFile();
@@ -155,56 +163,54 @@ public class LiteCask {
     }
 
     /** Scan all data files and rebuild KeyDir; set activeFileId accordingly. */
-    private void rebuildFromDisk() throws IOException {
+    private void rebuildFromDisk(int minFileId) throws IOException {
         File[] files = listDataFilesSorted();
         if (files.length == 0) {
-            this.activeFileId = 1; // start fresh
+            this.activeFileId = 1;
             return;
         }
 
+        // Gather files to process (newer than checkpoint)
+        List<File> toScan = new ArrayList<>();
         for (File f : files) {
             int fileId = parseFileId(f.getName());
-            File hint = new File(dataDir, "data" + fileId + ".hint");
+            if (fileId > minFileId) toScan.add(f);
+        }
+        if (toScan.isEmpty()) {
+            this.activeFileId = parseFileId(files[files.length - 1].getName());
+            return;
+        }
 
-            if (hint.exists()) {
-                loadFromHint(hint, fileId);
-            } else {
-                // fallback: scan full .dat
-                try (RandomAccessFile raf = new RandomAccessFile(f, "r")) {
-                    long len = raf.length();
-                    while (raf.getFilePointer() < len) {
-                        long start = raf.getFilePointer();
+        int threads = Math.min(Runtime.getRuntime().availableProcessors(), Math.max(1, toScan.size()));
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        List<Future<Map<String, KeyDir.EntryMeta>>> futures = new ArrayList<>();
 
-                        if (len - start < 4 + 4 + 1) break;
+        for (File f : toScan) {
+            futures.add(pool.submit(() -> scanFileFast(f)));
+        }
 
-                        int keyLen = raf.readInt();
-                        int valLen = raf.readInt();
-                        byte flag = raf.readByte();
-
-                        if (keyLen < 0 || valLen < 0) break;
-
-                        long afterHeader = raf.getFilePointer();
-                        long need = (long) keyLen + (long) valLen;
-                        if (afterHeader + need > len) break;
-
-                        byte[] keyBytes = new byte[keyLen];
-                        raf.readFully(keyBytes);
-                        String key = new String(keyBytes, "UTF-8");
-
-                        long valuePos = raf.getFilePointer();
-                        raf.seek(valuePos + valLen);
-
-                        if (flag == Entry.FLAG_TOMBSTONE) {
-                            keyDir.put(key, new KeyDir.EntryMeta(fileId, start, 0, flag));
-                        } else {
-                            keyDir.put(key, new KeyDir.EntryMeta(fileId, valuePos, valLen, flag));
-                        }
-                    }
+        // Merge results with latest-wins
+        for (Future<Map<String, KeyDir.EntryMeta>> fut : futures) {
+            try {
+                Map<String, KeyDir.EntryMeta> local = fut.get();
+                for (var e : local.entrySet()) {
+                    keyDir.put(e.getKey(), mergeLatest(keyDir.get(e.getKey()), e.getValue()));
                 }
+            } catch (ExecutionException | InterruptedException ex) {
+                throw new IOException("Parallel rebuild failed", ex);
             }
         }
 
+        pool.shutdown();
+
         this.activeFileId = parseFileId(files[files.length - 1].getName());
+    }
+
+    private KeyDir.EntryMeta mergeLatest(KeyDir.EntryMeta oldMeta, KeyDir.EntryMeta newMeta) {
+        if (oldMeta == null) return newMeta;
+        long oldV = versionOf(oldMeta);
+        long newV = versionOf(newMeta);
+        return (newV >= oldV) ? newMeta : oldMeta;
     }
 
 
@@ -258,6 +264,9 @@ public class LiteCask {
     public void checkpoint() throws IOException {
         File chk = new File(dataDir, "keydir.chk");
         try (DataOutputStream out = new DataOutputStream(new FileOutputStream(chk))) {
+            // Write header: last fileId we’ve fully processed
+            out.writeInt(activeFileId);
+
             for (var e : keyDir.entrySet()) {
                 byte[] keyBytes = e.getKey().getBytes("UTF-8");
                 KeyDir.EntryMeta meta = e.getValue();
@@ -270,12 +279,17 @@ public class LiteCask {
             }
         }
     }
-    
-    private void loadCheckpoint() throws IOException {
-        File chk = new File(dataDir, "keydir.chk");
-        if (!chk.exists()) return;
 
+    
+    private int loadCheckpoint() throws IOException {
+        File chk = new File(dataDir, "keydir.chk");
+        if (!chk.exists()) return 0;  // no checkpoint, start from scratch
+
+        int lastCheckpointedFileId;
         try (DataInputStream in = new DataInputStream(new FileInputStream(chk))) {
+            // first 4 bytes = max fileId covered
+            lastCheckpointedFileId = in.readInt();
+
             while (in.available() > 0) {
                 int keyLen = in.readInt();
                 byte[] keyBytes = new byte[keyLen];
@@ -290,6 +304,78 @@ public class LiteCask {
                 keyDir.put(key, new KeyDir.EntryMeta(fileId, valueOffset, valueSize, flag));
             }
         }
+        return lastCheckpointedFileId;
     }
 
+    
+    private long versionOf(KeyDir.EntryMeta m) {
+        long off = (m.entryStart >= 0 ? m.entryStart : m.valueOffset);
+        return ((long)m.fileId << 32) | (off & 0xffffffffL);
+    }
+    
+    private Map<String, KeyDir.EntryMeta> scanFileFast(File dataFile) throws IOException {
+        int fileId = parseFileId(dataFile.getName());
+        File hint = new File(dataDir, "data" + fileId + ".hint");
+
+        Map<String, KeyDir.EntryMeta> local = new HashMap<>();
+        if (hint.exists()) {
+            try (DataInputStream in = new DataInputStream(new FileInputStream(hint))) {
+                while (in.available() > 0) {
+                    int keyLen = in.readInt();
+                    int valueSize = in.readInt();
+                    int fId = in.readInt();
+                    long valueOffset = in.readLong();
+                    byte flag = in.readByte();
+                    byte[] keyBytes = new byte[keyLen];
+                    in.readFully(keyBytes);
+                    String key = new String(keyBytes, "UTF-8");
+
+                    // entryStart unknown in hints → use valueOffset as tie-breaker
+                    KeyDir.EntryMeta m = new KeyDir.EntryMeta(fId, valueOffset, valueSize, flag, valueOffset);
+                    local.merge(key, m, (a,b)-> mergeLatest(a,b));
+                }
+            }
+            return local;
+        }
+
+        // Fallback: scan .dat
+        try (RandomAccessFile raf = new RandomAccessFile(dataFile, "r")) {
+            long len = raf.length();
+            while (raf.getFilePointer() < len) {
+                long start = raf.getFilePointer();
+                if (len - start < 4 + 4 + 1) break;
+
+                int keyLen = raf.readInt();
+                int valLen = raf.readInt();
+                byte flag = raf.readByte();
+                if (keyLen < 0 || valLen < 0) break;
+
+                long afterHeader = raf.getFilePointer();
+                long need = (long) keyLen + (long) valLen;
+                if (afterHeader + need > len) break;
+
+                byte[] keyBytes = new byte[keyLen];
+                raf.readFully(keyBytes);
+                String key = new String(keyBytes, "UTF-8");
+
+                long valuePos = raf.getFilePointer();
+                raf.seek(valuePos + valLen);
+
+                KeyDir.EntryMeta m;
+                if (flag == Entry.FLAG_TOMBSTONE) {
+                    m = new KeyDir.EntryMeta(fileId, start, 0, flag, start);
+                } else {
+                    m = new KeyDir.EntryMeta(fileId, valuePos, valLen, flag, start);
+                }
+                local.merge(key, m, (a,b)-> mergeLatest(a,b));
+            }
+        }
+        return local;
+    }
+    
+    public java.util.Set<String> keys() {
+        java.util.HashSet<String> s = new java.util.HashSet<>();
+        for (var e : keyDir.entrySet()) s.add(e.getKey());
+        return s;
+    }
 }

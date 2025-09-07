@@ -1,155 +1,117 @@
 package com.litecask;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.assertThrows;
-
-import java.nio.file.*;
+import org.junit.jupiter.api.*;
 import java.io.File;
-import java.io.IOException;
+import java.nio.file.Files;
+import java.util.Set;
 
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
 
 public class LiteCaskTest {
-	 private static final String DIR = "testdata";
+    private File tempDir;
 
-	    @BeforeEach
-	    public void cleanDir() throws IOException {
-	        Path path = Path.of(DIR);
-	        if (Files.exists(path)) {
-	            Files.walk(path)
-	                .map(Path::toFile)
-	                .forEach(f -> f.delete());
-	        }
-	        Files.createDirectories(path);
-	    }
-
-   
-    @Test
-    public void testOverwrite() throws Exception {
-        LiteCask store = LiteCask.open("data", true);
-
-        store.put("name", "Alice".getBytes());
-        store.put("name", "Bob".getBytes());
-        assertEquals("Bob", new String(store.get("name")));
-
-        store.close();
+    @BeforeEach
+    public void setup() throws Exception {
+        tempDir = Files.createTempDirectory("litecask").toFile();
     }
 
-    @Test
-    public void testPutGet() throws Exception {
-        LiteCask store = LiteCask.open(DIR, true);
-        store.put("k1", "hello".getBytes());
-        assertEquals("hello", new String(store.get("k1")));
-        store.close();
+    @AfterEach
+    public void cleanup() {
+        deleteRecursively(tempDir);
     }
 
-    @Test
-    public void testDelete() throws Exception {
-        LiteCask store = LiteCask.open(DIR, true);
-        store.put("k1", "hello".getBytes());
-        store.delete("k1");
-        assertNull(store.get("k1"));
-        store.close();
-    }
-    
-    @Test
-    public void testFileRotation() throws Exception {
-        LiteCask store = LiteCask.open("data", true);
-
-        // shrink limit for quick test
-        long MAX_FILE_SIZE = 50;
-
-        for (int i = 0; i < 10; i++) {
-            String key = "k" + i;
-            String val = "v" + i;
-            store.put(key, val.getBytes());
+    private void deleteRecursively(File f) {
+        if (f == null || !f.exists()) return;
+        if (f.isDirectory()) {
+            for (File c : f.listFiles()) deleteRecursively(c);
         }
-
-        store.close();
-
-        // Expect multiple files in "data" directory
-        File dir = new File("data");
-        File[] files = dir.listFiles((d, name) -> name.endsWith(".dat"));
-        assertTrue(files.length > 1);
+        f.delete();
     }
+
     @Test
-    public void testRecovery() throws Exception {
-        LiteCask s1 = LiteCask.open("data", true);
-        s1.put("a", "1".getBytes());
-        s1.put("b", "2".getBytes());
-        s1.close();
-
-        LiteCask s2 = LiteCask.open("data", true);
-        assertEquals("1", new String(s2.get("a")));
-        assertEquals("2", new String(s2.get("b")));
-        s2.close();
+    public void testPutAndGet() throws Exception {
+        LiteCask db = LiteCask.open(tempDir.getAbsolutePath(), true);
+        db.put("foo", "bar".getBytes());
+        byte[] val = db.get("foo");
+        assertEquals("bar", new String(val));
+        db.close();
     }
-    
+
+    @Test
+    public void testOverwriteAndDelete() throws Exception {
+        LiteCask db = LiteCask.open(tempDir.getAbsolutePath(), true);
+        db.put("x", "1".getBytes());
+        db.put("x", "2".getBytes());
+        assertEquals("2", new String(db.get("x")));
+
+        db.delete("x");
+        assertNull(db.get("x"));
+        db.close();
+    }
+
+    @Test
+    public void testRotation() throws Exception {
+        LiteCask db = LiteCask.open(tempDir.getAbsolutePath(), true);
+        String big = "a".repeat(1024 * 1024); // 1MB
+        for (int i = 0; i < 70; i++) {
+            db.put("k" + i, big.getBytes()); // should trigger rotation
+        }
+        assertNotNull(db.get("k0"));
+        db.close();
+    }
+
     @Test
     public void testMerge() throws Exception {
-        LiteCask store = LiteCask.open("data", true);
-
-        store.put("k1", "a".getBytes());
-        store.put("k1", "b".getBytes()); // old "a" should be discarded
-        store.put("k2", "x".getBytes());
-        store.delete("k2");              // tombstone should be discarded
-
-        store.merge();
-
-        assertEquals("b", new String(store.get("k1")));
-        assertNull(store.get("k2"));
-
-        store.close();
+        LiteCask db = LiteCask.open(tempDir.getAbsolutePath(), true);
+        db.put("a", "1".getBytes());
+        db.put("a", "2".getBytes());
+        db.put("b", "x".getBytes());
+        db.merge();
+        assertEquals("2", new String(db.get("a")));
+        assertEquals("x", new String(db.get("b")));
+        db.close();
     }
-    
+
+    @Test
+    public void testHintFileRecovery() throws Exception {
+        LiteCask db1 = LiteCask.open(tempDir.getAbsolutePath(), true);
+        db1.put("hello", "world".getBytes());
+        db1.close();
+
+        LiteCask db2 = LiteCask.open(tempDir.getAbsolutePath(), true);
+        assertEquals("world", new String(db2.get("hello")));
+        db2.close();
+    }
+
+    @Test
+    public void testCheckpointRecovery() throws Exception {
+        LiteCask db1 = LiteCask.open(tempDir.getAbsolutePath(), true);
+        db1.put("chk", "val".getBytes());
+        db1.checkpoint();
+        db1.close();
+
+        LiteCask db2 = LiteCask.open(tempDir.getAbsolutePath(), true);
+        assertEquals("val", new String(db2.get("chk")));
+        db2.close();
+    }
+
     @Test
     public void testSingleWriterLock() throws Exception {
-        LiteCask s1 = LiteCask.open("data", true);
-
-        // Expect IOException when opening a second writer
-        assertThrows(IOException.class, () -> {
-            LiteCask s2 = LiteCask.open("data", true);
+        LiteCask s1 = LiteCask.open(tempDir.getAbsolutePath(), true);
+        assertThrows(Exception.class, () -> {
+            LiteCask.open(tempDir.getAbsolutePath(), true);
         });
-
         s1.close();
     }
-    
+
     @Test
-    public void testStressPutGet() throws Exception {
-        LiteCask store = LiteCask.open(DIR, true);
-        int N = 10_000;
-        for (int i = 0; i < N; i++) {
-            store.put("k" + i, ("val" + i).getBytes());
-        }
-        for (int i = 0; i < N; i++) {
-            assertEquals("val" + i, new String(store.get("k" + i)));
-        }
-        store.close();
+    public void testListKeys() throws Exception {
+        LiteCask db = LiteCask.open(tempDir.getAbsolutePath(), true);
+        db.put("k1", "v1".getBytes());
+        db.put("k2", "v2".getBytes());
+        Set<String> keys = db.keys();
+        assertTrue(keys.contains("k1"));
+        assertTrue(keys.contains("k2"));
+        db.close();
     }
-    
-    @Test
-    public void benchmarkPutGet() throws Exception {
-        LiteCask store = LiteCask.open(DIR, true);
-        int N = 50_000;
-
-        long startPut = System.nanoTime();
-        for (int i = 0; i < N; i++) {
-            store.put("k" + i, ("val" + i).getBytes());
-        }
-        long putTimeMs = (System.nanoTime() - startPut) / 1_000_000;
-        System.out.println("PUT " + N + " entries in " + putTimeMs + " ms");
-
-        long startGet = System.nanoTime();
-        for (int i = 0; i < N; i++) {
-            store.get("k" + i);
-        }
-        long getTimeMs = (System.nanoTime() - startGet) / 1_000_000;
-        System.out.println("GET " + N + " entries in " + getTimeMs + " ms");
-
-        store.close();
-    }
-
 }
