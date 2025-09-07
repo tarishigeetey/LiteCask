@@ -1,27 +1,32 @@
 package com.litecask;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import java.nio.file.*;
 import java.io.File;
+import java.io.IOException;
 
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 public class LiteCaskTest {
-    @Test
-    public void testPutGet() throws Exception {
-        LiteCask store = LiteCask.open("data", true);
+	 private static final String DIR = "testdata";
 
-        store.put("name", "Alice".getBytes());
-        byte[] val = store.get("name");
+	    @BeforeEach
+	    public void cleanDir() throws IOException {
+	        Path path = Path.of(DIR);
+	        if (Files.exists(path)) {
+	            Files.walk(path)
+	                .map(Path::toFile)
+	                .forEach(f -> f.delete());
+	        }
+	        Files.createDirectories(path);
+	    }
 
-        assertNotNull(val);
-        assertEquals("Alice", new String(val));
-
-        store.close();
-    }
+   
     @Test
     public void testOverwrite() throws Exception {
         LiteCask store = LiteCask.open("data", true);
@@ -34,13 +39,19 @@ public class LiteCaskTest {
     }
 
     @Test
+    public void testPutGet() throws Exception {
+        LiteCask store = LiteCask.open(DIR, true);
+        store.put("k1", "hello".getBytes());
+        assertEquals("hello", new String(store.get("k1")));
+        store.close();
+    }
+
+    @Test
     public void testDelete() throws Exception {
-        LiteCask store = LiteCask.open("data", true);
-
-        store.put("name", "Alice".getBytes());
-        store.delete("name");
-        assertNull(store.get("name"));
-
+        LiteCask store = LiteCask.open(DIR, true);
+        store.put("k1", "hello".getBytes());
+        store.delete("k1");
+        assertNull(store.get("k1"));
         store.close();
     }
     
@@ -90,6 +101,53 @@ public class LiteCaskTest {
 
         assertEquals("b", new String(store.get("k1")));
         assertNull(store.get("k2"));
+
+        store.close();
+    }
+    
+    @Test
+    public void testSingleWriterLock() throws Exception {
+        LiteCask s1 = LiteCask.open("data", true);
+
+        // Expect IOException when opening a second writer
+        assertThrows(IOException.class, () -> {
+            LiteCask s2 = LiteCask.open("data", true);
+        });
+
+        s1.close();
+    }
+    
+    @Test
+    public void testStressPutGet() throws Exception {
+        LiteCask store = LiteCask.open(DIR, true);
+        int N = 10_000;
+        for (int i = 0; i < N; i++) {
+            store.put("k" + i, ("val" + i).getBytes());
+        }
+        for (int i = 0; i < N; i++) {
+            assertEquals("val" + i, new String(store.get("k" + i)));
+        }
+        store.close();
+    }
+    
+    @Test
+    public void benchmarkPutGet() throws Exception {
+        LiteCask store = LiteCask.open(DIR, true);
+        int N = 50_000;
+
+        long startPut = System.nanoTime();
+        for (int i = 0; i < N; i++) {
+            store.put("k" + i, ("val" + i).getBytes());
+        }
+        long putTimeMs = (System.nanoTime() - startPut) / 1_000_000;
+        System.out.println("PUT " + N + " entries in " + putTimeMs + " ms");
+
+        long startGet = System.nanoTime();
+        for (int i = 0; i < N; i++) {
+            store.get("k" + i);
+        }
+        long getTimeMs = (System.nanoTime() - startGet) / 1_000_000;
+        System.out.println("GET " + N + " entries in " + getTimeMs + " ms");
 
         store.close();
     }
