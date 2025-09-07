@@ -6,6 +6,7 @@ public class Entry {
     public static final byte FLAG_PUT = 0;
     public static final byte FLAG_TOMBSTONE = 1;
 
+
     public final String key;
     public final byte[] value;
     public final byte flag;
