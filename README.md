@@ -14,7 +14,7 @@ It uses an **append-only log** and an **in-memory index (KeyDir)** for fast read
 - Hint files for faster startup  
 - Checkpointing for near-instant recovery  
 - Interactive CLI (`put`, `get`, `delete`, `list`, `merge`)  
-- REST API (via [Javalin](https://javalin.io)) to expose LiteCask as a service  
+- REST API to expose LiteCask as a service  
 
 ---
 
