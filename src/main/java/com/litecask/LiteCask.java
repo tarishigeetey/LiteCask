@@ -283,12 +283,18 @@ public class LiteCask {
     
     private int loadCheckpoint() throws IOException {
         File chk = new File(dataDir, "keydir.chk");
-        if (!chk.exists()) return 0;  // no checkpoint, start from scratch
+        if (!chk.exists()) return 0;
 
-        int lastCheckpointedFileId;
+        int lastCheckpointedFileId = 0;
         try (DataInputStream in = new DataInputStream(new FileInputStream(chk))) {
-            // first 4 bytes = max fileId covered
-            lastCheckpointedFileId = in.readInt();
+            in.mark(4);
+            try {
+                // Try to read header (new format)
+                lastCheckpointedFileId = in.readInt();
+            } catch (EOFException e) {
+                // Old format → reset stream
+                in.reset();
+            }
 
             while (in.available() > 0) {
                 int keyLen = in.readInt();
@@ -306,6 +312,7 @@ public class LiteCask {
         }
         return lastCheckpointedFileId;
     }
+
 
     
     private long versionOf(KeyDir.EntryMeta m) {
